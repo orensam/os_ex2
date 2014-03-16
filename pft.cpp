@@ -270,13 +270,32 @@ std::pair<fd_set, fd_set> getReadWriteFDs()
 
 std::string readAllFromFD(int fd)
 {
-	std::string str = "";
+	std::cout << "BEGIN read all from fd " << std::endl;
+	std::string str;
+	int bytes;
 	char temp_buff[PIPE_BUF] = "";
-	while (read(fd, temp_buff, PIPE_BUF) > 0)
+	while ((bytes = read(fd, temp_buff, PIPE_BUF)) > 0)
 	{
-		str += temp_buff;
+		std::cout << "IN WHILE read all from fd. tmp_buff is: " << temp_buff << std::endl;
+		str.append(temp_buff);
+		std::cout << "END WHILE BODY" << std::endl;
 	}
+	std::cout << "END read all from fd " << std::endl;
 	return str;
+}
+
+int getMaxFD()
+{
+	int max_fd = 0;
+	for(int child = 0; child < para_level; child++)
+	{
+		int child_fd = FDReadFromChild(child);
+		if (child_fd > max_fd)
+		{
+			max_fd = child_fd;
+		}
+	}
+	return max_fd;
 }
 /*
 This function uses ‘file’ to calculate the type of each file in the given vector using n parallelism level.
@@ -312,20 +331,20 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 	std::pair<fd_set, fd_set> fds = getReadWriteFDs();
 	fd_set reads = fds.first;
 	fd_set writes = fds.second;
-	for(int child = 0; child < para_level; ++child)
-	{
-		int read_fd = FDReadFromChild(child);
-		int write_fd = FDWriteToChild(child);
-		if(FD_ISSET(read_fd, &reads))
-		{
-			std::cout << "Read FD: " << read_fd << std::endl;
-		}
-
-		if(FD_ISSET(write_fd, &writes))
-		{
-			std::cout << "Write FD: " << write_fd << std::endl;
-		}
-	}
+//	for(int child = 0; child < para_level; ++child)
+//	{
+//		int read_fd = FDReadFromChild(child);
+//		int write_fd = FDWriteToChild(child);
+//		if(FD_ISSET(read_fd, &reads))
+//		{
+//			std::cout << "Read FD: " << read_fd << std::endl;
+//		}
+//
+//		if(FD_ISSET(write_fd, &writes))
+//		{
+//			std::cout << "Write FD: " << write_fd << std::endl;
+//		}
+//	}
 
 	while(remaining_files != 0)
 	{
@@ -336,46 +355,52 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 
 		int n_ready_writes = para_level;
 
+
 		// Writing loop
 		for(int child = 0; child < para_level; ++child)
 		{
-
-			std::cout << "Handling writing to child " << child << std::endl;
-
 			int write_fd = FDWriteToChild(child);
 			if(FD_ISSET(write_fd, &ready_writes))
 			{
+				std::cout << "Handling writing to child " << child << std::endl;
 				//send min(CHUNK_ZISE,remainig_files/ready) files
+
 				int send_files_n = std::min(CHUNK_SIZE, remaining_files/n_ready_writes);
 				positions[child].first = last_sent;
 				int j;
+				std::string filenames="";
 				for(j = positions[child].first; j < positions[child].first + send_files_n; j++)
 				{
-					int written = write(write_fd, file_names_vec[j].c_str(), file_names_vec[j].size());
-					if (!written)
-					{
-						//ERROR
-					}
+					filenames += file_names_vec[j] + "\n";
+				}
+				std::cout << "Writing the string: '" << filenames << "' to child " << child << std::endl;
+				int written = write(write_fd, filenames.c_str(), filenames.size()+1);
+				if (!written)
+				{
+					//ERROR
 				}
 				last_sent = j;
 			}
 		}
 
 		std::cout << "Before read SELECT"  << std::endl;
-		select(para_level, &ready_reads, NULL, NULL, NULL); //add timeout?
+		select(getMaxFD()+1, &ready_reads, NULL, NULL, NULL); //add timeout?
 		std::cout << "After read SELECT"  << std::endl;
 
+		// Reading loop
 		for(int child = 0; child < para_level; ++child)
 		{
-			std::cout << "Handling read from child " << child << std::endl;
 			int read_fd = FDReadFromChild(child);
 			if(FD_ISSET(read_fd, &ready_reads))
 			{
+				std::cout << "Handling read from child " << child << std::endl;
 				std::istringstream output(readAllFromFD(read_fd));
+
 				std::string line;
 				int startPos = positions[child].first;
 				while (std::getline(output, line))
 				{
+					std::cout << "in getline while" << std::endl;
 					types_vec.insert(types_vec.begin()+startPos, line);
 					startPos++;
 					remaining_files--;
@@ -383,11 +408,33 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 			}
 		}
 
+		std::cout << "After read loop" << std::endl;
+
+
+
 //		std::cout << "before write select" << std::endl;
 //		n_ready_writes = select(para_level, NULL, &ready_writes, NULL, NULL); //add timeout?
 //		std::cout << "After write select. n_ready_writes: " << n_ready_writes << std::endl;
 	}
 	std::cout << "After first SELECT"  << std::endl;
+
+	return 0;
+}
+
+
+int testPipe()
+{
+	int pipefd[2];
+	pipe(pipefd);
+	fd_set fds;
+	FD_ZERO(&fds);
+	FD_SET(pipefd[0], &fds);
+
+	write(pipefd[1], "hello", 6);
+
+	std::cout << "TEST: Before SELECT"  << std::endl;
+	select(pipefd[0]+1, &fds, NULL, NULL, NULL); //add timeout?
+	std::cout << "TEST: After SELECT"  << std::endl;
 
 	return 0;
 }
@@ -401,8 +448,9 @@ void printVector(std::vector<std::string>& vec)
 }
 int main()
 {
+//	testPipe();
 	pft_init(3);
-	sleep(1);
+//	sleep(1);
 	std::vector<std::string> file_names_vec;
 	std::vector<std::string> types_vec;
 	file_names_vec.push_back("test1.pdf");
