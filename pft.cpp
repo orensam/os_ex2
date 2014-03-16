@@ -11,17 +11,21 @@
 #include <algorithm>
 #include <unistd.h>
 #include <limits.h>
+#include <sstream>
+#include <iostream>
 
 // Parallelism level
 static int para_level;
+static bool pipes_inited = false;
 
 // Last error in the library
 static std::string last_error = "";
 
 // file program command
-static const char* FILE_CMD_PATH = "/bin/file";
+static const char* FILE_CMD_PATH = "/usr/bin/file";
 static const char* FILE_CMD = "file";
-static const char* FILE_FLAGS = "-n -f-";
+static const char* FILE_FLAG_FLUSH = "-n";
+static const char* FILE_FLAG_STDIN = "-f-";
 
 // Process chuck size
 const int CHUNK_SIZE = 50;
@@ -38,6 +42,25 @@ int total_time;
 int total_file_num;
 
 
+int FDReadFromParent(int child_num)
+{
+	return outPipes[child_num][0];
+}
+
+int FDWriteToChild(int child_num)
+{
+	return outPipes[child_num][1];
+}
+
+int FDReadFromChild(int child_num)
+{
+	return inPipes[child_num][0];
+}
+
+int FDWriteToParent(int child_num)
+{
+	return inPipes[child_num][1];
+}
 
 /**
  * Creates para_level pipes for reading and para_level pipes for writing.
@@ -45,29 +68,61 @@ int total_file_num;
  */
 int createPipes()
 {
-
 	inPipes = new int*[para_level];
 	outPipes = new int*[para_level];
 
-	for (int i = 0; i < para_level; ++i) {
-		inPipes[i] = new int[2];
-		outPipes[i] = new int[2];
-	}
-	std::for_each(inPipes, inPipes + sizeof(inPipes), pipe);
-	std::for_each(outPipes, outPipes + sizeof(outPipes), pipe);
-
-	// Create fd_sets from the in/out pipes.
-	fd_set reads;
-	fd_set writes;
-	FD_ZERO(&reads);
-	FD_ZERO(&writes);
-	for(int i = 0; i < para_level; i++)
+	for (int child = 0; child < para_level; ++child)
 	{
-		FD_SET(inPipes[i][0], &reads);
-		FD_SET(outPipes[i][1], &writes);
+		// HANDLE ERRORS!
+		inPipes[child] = new int[2];
+		outPipes[child] = new int[2];
+		pipe(inPipes[child]);
+		pipe(outPipes[child]);
 	}
+	pipes_inited = true;
+	return 0;
 }
 
+
+
+int spawnChildren()
+{
+	createPipes();
+	pid_t parent_pid = getpid();
+	pid_t pid;
+
+	for(int child = 0; child < para_level; ++child)
+	{
+		pid_t pid = fork();
+
+		if(pid < 0)
+		{
+			//ERROR
+		}
+
+		else if (pid == 0)
+		{
+			std::cout << "I am a spawned child! my pid is:" << getpid() << std::endl;
+			dup2(FDReadFromParent(child), STDIN_FILENO);
+			dup2(FDWriteToParent(child), STDOUT_FILENO);
+
+			close(FDReadFromChild(child));
+			close(FDWriteToParent(child));
+			close(FDReadFromParent(child));
+			close(FDWriteToChild(child));
+
+			int res = execl(FILE_CMD_PATH, FILE_CMD, FILE_FLAG_FLUSH, FILE_FLAG_STDIN, NULL);
+			std::cout << "After execl, result: " << res << std::endl;
+			// ERROR
+		}
+		else
+		{
+			close(FDWriteToParent(child));
+			close(FDReadFromParent(child));
+			//ERROR
+		}
+	}
+}
 
 /*
 Initialize the pft library.
@@ -81,22 +136,29 @@ Return value:
  */
 int pft_init(int n)
 {
+	std::cout << "Start init" << std::endl;
 	pft_clear_stats();
 	setParallelismLevel(n);
-	createPipes();
+	std::cout << "End init" << std::endl;
 }
 
 
-int killPipes()
+int killChildren()
 {
-	for(int i = 0; i < para_level; ++i)
+	if (pipes_inited)
 	{
-		close(inPipes[i][0]);
-		close(outPipes[i][0]);
-		close(inPipes[i][1]);
-		close(outPipes[i][1]);
-		//send sig to child i to commit suicide
+		for(int child = 0; child < para_level; ++child)
+		{
+			close(FDReadFromChild(child));
+			close(FDWriteToChild(child));
+			delete[] inPipes[child];
+			delete[] outPipes[child];
+		}
+		delete[] inPipes;
+		delete[] outPipes;
 	}
+	pipes_inited = false;
+	return 0;
 }
 
 
@@ -113,7 +175,7 @@ Return value:
 
 int pft_done()
 {
-	return killPipes();
+	return killChildren();
 }
 
 
@@ -133,9 +195,9 @@ int setParallelismLevel(int n)
 	{
 		//ERROR
 	}
-	killPipes();
+	killChildren();
 	para_level = n;
-	createPipes();
+	spawnChildren();
 }
 
 /*
@@ -175,7 +237,7 @@ int pft_get_stats(pft_stats_struct* statistic)
 	}
 	statistic->time_sec = total_time;
 	statistic->file_num = total_file_num;
-
+	return 0;
 }
 
 /*
@@ -188,25 +250,7 @@ void pft_clear_stats()
 	total_file_num = 0;
 }
 
-int P2CReadFD(int child_num)
-{
-	return outPipes[child_num][0];
-}
 
-int P2CWriteFD(int child_num)
-{
-	return outPipes[child_num][1];
-}
-
-int C2PReadFD(int child_num)
-{
-	return inPipes[child_num][0];
-}
-
-int C2PWriteFD(int child_num)
-{
-	return inPipes[child_num][1];
-}
 
 std::pair<fd_set, fd_set> getReadWriteFDs()
 {
@@ -217,16 +261,23 @@ std::pair<fd_set, fd_set> getReadWriteFDs()
 	for(int child = 0; child < para_level; child++)
 	{
 		// Add parent read+write ends to sets
-		FD_SET(C2PReadFD(child), &reads);
-		FD_SET(P2CWriteFD(child), &writes);
-		// Close child read+write ends
-		close(C2PWriteFD(child));
-		close(P2CReadFD(child));
+		FD_SET(FDReadFromChild(child), &reads);
+		FD_SET(FDWriteToChild(child), &writes);
 	}
 	std::pair<fd_set, fd_set> fds = std::make_pair(reads, writes);
 	return fds;
 }
 
+std::string readAllFromFD(int fd)
+{
+	std::string str = "";
+	char temp_buff[PIPE_BUF] = "";
+	while (read(fd, temp_buff, PIPE_BUF) > 0)
+	{
+		str += temp_buff;
+	}
+	return str;
+}
 /*
 This function uses ‘file’ to calculate the type of each file in the given vector using n parallelism level.
 It gets a vector contains the name of the files to check (file_names_vec) and an empty vector (types_vec).
@@ -245,7 +296,9 @@ Return value:
  */
 int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::string>& types_vec)
 {
+	std::cout << "Starting findTypes" << std::endl;
 	int total_files = file_names_vec.size();
+	types_vec = std::vector<std::string>(para_level);
 
 	if(total_files < para_level)
 	{
@@ -253,94 +306,112 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 	}
 
 	int remaining_files = total_files;
+	int last_sent = 0;
+	std::vector< std::pair<int, int> > positions(para_level, std::make_pair(0,0));
 
-	int last_sent = -1;
-	pid_t parent_pid = getpid();
-
-	for(int i = 0; i < para_level; ++i)
+	std::pair<fd_set, fd_set> fds = getReadWriteFDs();
+	fd_set reads = fds.first;
+	fd_set writes = fds.second;
+	for(int child = 0; child < para_level; ++child)
 	{
-		pid_t pid = fork();
-		if(pid < 0)
+		int read_fd = FDReadFromChild(child);
+		int write_fd = FDWriteToChild(child);
+		if(FD_ISSET(read_fd, &reads))
 		{
-			//ERROR
+			std::cout << "Read FD: " << read_fd << std::endl;
 		}
-		if(pid == 0)
+
+		if(FD_ISSET(write_fd, &writes))
 		{
-			// In child process
-			// Wrap this in runChild(i) ??
-			dup2(outPipes[i][0], STDIN_FILENO);
-			dup2(inPipes[i][1], STDOUT_FILENO);
-			close(inPipes[i][0]);
-			close(outPipes[i][1]);
-			close(inPipes[i][1]);
-			close(outPipes[i][0]);
-			execl(FILE_CMD_PATH, FILE_CMD, FILE_FLAGS, NULL);
-			break;
+			std::cout << "Write FD: " << write_fd << std::endl;
 		}
 	}
 
-	if (getpid() == parent_pid)
+	while(remaining_files != 0)
 	{
-		// In parent process - handle file command dispatch
-//		fd_set reads;
-//		fd_set writes;
-//		FD_ZERO(&reads);
-//		FD_ZERO(&writes);
-//		for(int i = 0; i < para_level; i++)
-//		{
-//			FD_SET(inPipes[i][0], &reads);
-//			FD_SET(outPipes[i][1], &writes);
-//
-//			close(inPipes[i][1]);
-//			close(outPipes[i][0]);
-//		}
+		std::cout << "In while. Remaining files: " << remaining_files << std::endl;
+		fd_set ready_reads = reads;
+		fd_set ready_writes =  writes;
 
-		std::pair<fd_set, fd_set> fds = getReadWriteFDs();
-		fd_set reads = fds.first;
-		fd_set writes = fds.second;
 
-		while(remaining_files != 0)
+		int n_ready_writes = para_level;
+
+		// Writing loop
+		for(int child = 0; child < para_level; ++child)
 		{
-			fd_set ready_reads = reads;
-			fd_set ready_writes =  writes;
 
-			select(para_level, &ready_reads, NULL, NULL, NULL); //add timeout?
-			int n_ready_writes = select(para_level, NULL, &ready_writes, NULL, NULL); //add timeout?
+			std::cout << "Handling writing to child " << child << std::endl;
 
-			for(int i = 0; i < para_level; ++i)
+			int write_fd = FDWriteToChild(child);
+			if(FD_ISSET(write_fd, &ready_writes))
 			{
-				if(FD_ISSET(inPipes[i][0], &ready_reads))
+				//send min(CHUNK_ZISE,remainig_files/ready) files
+				int send_files_n = std::min(CHUNK_SIZE, remaining_files/n_ready_writes);
+				positions[child].first = last_sent;
+				int j;
+				for(j = positions[child].first; j < positions[child].first + send_files_n; j++)
 				{
-					char temp_buff[PIPE_BUF];
-					read(inPipes[i][0], temp_buff, PIPE_BUF);
-					while()
-						if(types_vec.end().find("\n") == -1)
-						{
-							types_vec.end() += getline(temp_buff);
-						}
-						else
-						{
-						types_vec.push_back(std::string(temp_buff));
-						//remaining_files--;
-						}
-				}
-				if(FD_ISSET(inPipes[i][1], &ready_writes))
-				{
-					//send min(CHUNK_ZISE,remainig_files/ready) files
-					int send_files_n = std::min(CHUNK_SIZE, remaining_files/n_ready_writes);
-					int j;
-					for(j = last_sent; j < last_sent + send_files_n; j++)
+					int written = write(write_fd, file_names_vec[j].c_str(), file_names_vec[j].size());
+					if (!written)
 					{
-						write(outPipes[i][1], file_names_vec[j].c_str(), file_names_vec[j].size());
-
+						//ERROR
 					}
-					last_sent = j;
+				}
+				last_sent = j;
+			}
+		}
+
+		std::cout << "Before read SELECT"  << std::endl;
+		select(para_level, &ready_reads, NULL, NULL, NULL); //add timeout?
+		std::cout << "After read SELECT"  << std::endl;
+
+		for(int child = 0; child < para_level; ++child)
+		{
+			std::cout << "Handling read from child " << child << std::endl;
+			int read_fd = FDReadFromChild(child);
+			if(FD_ISSET(read_fd, &ready_reads))
+			{
+				std::istringstream output(readAllFromFD(read_fd));
+				std::string line;
+				int startPos = positions[child].first;
+				while (std::getline(output, line))
+				{
+					types_vec.insert(types_vec.begin()+startPos, line);
+					startPos++;
+					remaining_files--;
 				}
 			}
 		}
-	}
 
+//		std::cout << "before write select" << std::endl;
+//		n_ready_writes = select(para_level, NULL, &ready_writes, NULL, NULL); //add timeout?
+//		std::cout << "After write select. n_ready_writes: " << n_ready_writes << std::endl;
+	}
+	std::cout << "After first SELECT"  << std::endl;
+
+	return 0;
 }
+
+void printVector(std::vector<std::string>& vec)
+{
+	for (unsigned int i=0; i<vec.size(); ++i)
+	{
+		std::cout << vec[i] << std::endl;
+	}
+}
+int main()
+{
+	pft_init(3);
+	sleep(1);
+	std::vector<std::string> file_names_vec;
+	std::vector<std::string> types_vec;
+	file_names_vec.push_back("test1.pdf");
+	file_names_vec.push_back("test2.tar");
+	file_names_vec.push_back("test3.zip");
+	pft_find_types(file_names_vec, types_vec);
+	printVector(types_vec);
+}
+
 
 
 
