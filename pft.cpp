@@ -6,6 +6,8 @@
  */
 
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <string>
 #include <algorithm>
 #include <unistd.h>
@@ -60,45 +62,47 @@ const int DEFAULT_CHUNK_SIZE = 50;
 // Parent <-> Children communication pipes
 //std::vector<int*> outPipes; // Parent writes to children
 //std::vector<int*> inPipes; // Parent reads from children
-int** outPipes = NULL; // Parent writes to children
-int** inPipes = NULL; // Parent reads from children
+int** outPipes = nullptr; // Parent writes to children
+int** inPipes = nullptr; // Parent reads from children
+
+std::vector<pid_t> children;
 
 // Stats
-int total_time;
-int total_file_num;
+double statTime;
+int statFileNum;
 
 
 
 /**
- * Returns the file descriptor for child #child_num to read from parent
+ * Returns the file descriptor for child #childNum to read from parent
  */
-int FDReadFromParent(int child_num)
+int FDReadFromParent(int childNum)
 {
-	return outPipes[child_num][0];
+	return outPipes[childNum][0];
 }
 
 /**
- * Returns the file descriptor for parent to write to child #child_num
+ * Returns the file descriptor for parent to write to child #childNum
  */
-int FDWriteToChild(int child_num)
+int FDWriteToChild(int childNum)
 {
-	return outPipes[child_num][1];
+	return outPipes[childNum][1];
 }
 
 /**
- * Returns the file descriptor for parent to read from child #child_num
+ * Returns the file descriptor for parent to read from child #childNum
  */
-int FDReadFromChild(int child_num)
+int FDReadFromChild(int childNum)
 {
-	return inPipes[child_num][0];
+	return inPipes[childNum][0];
 }
 
 /**
- * Returns the file descriptor for child #child_num to write to parent
+ * Returns the file descriptor for child #childNum to write to parent
  */
-int FDWriteToParent(int child_num)
+int FDWriteToParent(int childNum)
 {
-	return inPipes[child_num][1];
+	return inPipes[childNum][1];
 }
 
 void setError(const std::string& func_name, const std::string& error)
@@ -122,8 +126,8 @@ int createPipes()
 
 	for (int child = 0; child < para_level; ++child)
 	{
-		inPipes[child] = NULL;
-		outPipes[child] = NULL;
+		inPipes[child] = nullptr;
+		outPipes[child] = nullptr;
 	}
 
 	for (int child = 0; child < para_level; ++child)
@@ -159,6 +163,7 @@ int killChildren()
 			}
 			delete[] inPipes[child];
 			delete[] outPipes[child];
+			waitpid(children[child], NULL, 0);
 		}
 		delete[] inPipes;
 		delete[] outPipes;
@@ -190,17 +195,18 @@ int spawnChildren()
 
 		else if (pid == 0)
 		{
-			//			std::cout << "I am a spawned child! my pid is:" << getpid() << std::endl;
 			if(dup2(FDReadFromParent(child), STDIN_FILENO) < 0 ||
 			   dup2(FDWriteToParent(child), STDOUT_FILENO) < 0)
 			{
 				throw ERROR_DUP;
 			}
 
-			if(close(FDReadFromChild(child)) < 0 || close(FDWriteToParent(child)) < 0 ||
-			   close(FDReadFromParent(child)) < 0 || close(FDWriteToChild(child)) < 0 )
+			for (int i = 0; i < para_level; ++i)
 			{
-				throw ERROR_CLOSE;
+				if (close(FDReadFromChild(i)) < 0 || close(FDWriteToChild(i)) < 0 )
+				{
+					throw ERROR_CLOSE;
+				}
 			}
 
 			int res = execl(FILE_CMD_PATH, FILE_CMD, FILE_FLAG_FLUSH, FILE_FLAG_STDIN, NULL);
@@ -208,9 +214,11 @@ int spawnChildren()
 			{
 				throw ERROR_EXECL;
 			}
+
 		}
 		else
 		{
+			children.push_back(pid);
 			if(close(FDWriteToParent(child)) < 0 || close(FDReadFromParent(child)) < 0)
 			{
 				throw ERROR_CLOSE;
@@ -342,8 +350,8 @@ int pft_get_stats(pft_stats_struct* statistic)
 		setError(FUNC_GET_STATS, ERROR_NULLPTR);
 		return CODE_FAIL;
 	}
-	statistic->time_sec = total_time;
-	statistic->file_num = total_file_num;
+	statistic->time_sec = statTime;
+	statistic->file_num = statFileNum;
 	return CODE_SUCCESS;
 }
 
@@ -353,8 +361,8 @@ int pft_get_stats(pft_stats_struct* statistic)
  */
 void pft_clear_stats()
 {
-	total_time = 0;
-	total_file_num = 0;
+	statTime = 0;
+	statFileNum = 0;
 }
 
 
@@ -396,6 +404,17 @@ int getMaxFD()
 	return max_fd;
 }
 
+
+/**
+ * Calculates the time difference between two given timevals.
+ */
+double calcTimeDiff(timeval* t1, timeval* t2)
+{
+	timeval res;
+	timersub(t2, t1, &res);
+	return res.tv_sec + res.tv_usec / 1000000.0;
+}
+
 /*
 This function uses ‘file’ to calculate the type of each file in the given vector using n parallelism level.
 It gets a vector contains the name of the files to check (file_names_vec) and an empty vector (types_vec).
@@ -429,6 +448,13 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 	int max_fd = getMaxFD()+1;
 	fd_set reads = getReadFDs();
 
+	timeval begin;
+	timeval end;
+
+	if (gettimeofday(&begin, NULL) != CODE_SUCCESS)
+	{
+		return CODE_FAIL;
+	}
 	while(remaining_read_files > 0)
 	{
 		// Write to children
@@ -436,19 +462,19 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 		{
 			if(positions[child].empty())
 			{
-				std::cout << "CAN WRITE (empty queue) to child " << child << ". to_write: " << to_write << std::endl;
+//				std::cout << "CAN WRITE (empty queue) to child " << child << ". to_write: " << to_write << std::endl;
 				std::string filenames = "";
 				for (int i = 0; i < send_files_n && to_write < total_files; ++i, ++to_write)
 				{
 					filenames += file_names_vec[to_write] + NEWLINE;
 					positions[child].push(to_write);
-					std::cout << "child: " << child << " index: " << to_write << std::endl;
+//					std::cout << "child: " << child << " index: " << to_write << std::endl;
 				}
 
 				int write_fd = FDWriteToChild(child);
-				std::cout << "Writing the string: '" << filenames << "' to child " << child << std::endl;
+//				std::cout << "Writing the string: '" << filenames << "' to child " << child << std::endl;
 				int written = write(write_fd, filenames.c_str(), filenames.size());
-				std::cout << "Wrote " << written << " bytes to child " << child << std::endl;
+//				std::cout << "Wrote " << written << " bytes to child " << child << std::endl;
 				if (written < 0)
 				{
 					setError(FUNC_FIND_TYPES, ERROR_WRITE);
@@ -464,7 +490,7 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 		// Read from children
 		for(int child = 0; child < para_level; ++child)
 		{
-			std::cout << "Handling read from child " << child << std::endl;
+//			std::cout << "Handling read from child " << child << std::endl;
 			int read_fd = FDReadFromChild(child);
 			if(remaining_read_files > 0 && FD_ISSET(read_fd, &ready_reads))
 			{
@@ -479,11 +505,11 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 					return CODE_FAIL;
 				}
 
-				std::cout << "Read from child " << child << " output: "<< output << std::endl;
+//				std::cout << "Read from child " << child << " output: "<< output << std::endl;
 				int pos = 0;
 				while ((pos = output.find(NEWLINE)) != -1 && remaining_read_files > 0)
 				{
-					std::cout << "read child: " << child << ", index of newline: " << pos << ", file_vec index: " << positions[child].front() << " Got string: " << output.substr(0, pos) << std::endl;
+//					std::cout << "read child: " << child << ", index of newline: " << pos << ", file_vec index: " << positions[child].front() << " Got string: " << output.substr(0, pos) << std::endl;
 					types_vec[positions[child].front()].append(output.substr(0, pos));
 					positions[child].pop();
 					output = output.substr(pos + 1);
@@ -496,17 +522,16 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 			}
 		}
 	}
+
+	if (gettimeofday(&end, NULL) != CODE_SUCCESS)
+	{
+		return CODE_FAIL;
+	}
+
+	statFileNum = total_files;
+	statTime = calcTimeDiff(&begin, &end);
 	return CODE_SUCCESS;
 }
-/////////////////////////////////////
-/////////////////////////////////////
-
-
-
-
-
-
-
 
 void printVector(std::vector<std::string>& vec)
 {
@@ -517,8 +542,6 @@ void printVector(std::vector<std::string>& vec)
 	}
 }
 
-
-
 int main()
 {
 	pft_init(200);
@@ -526,7 +549,7 @@ int main()
 	std::vector<std::string> file_names_vec;
 	std::vector<std::string> types_vec;
 
-	for(int i=0; i<500; ++i)
+	for(int i=0; i<50000; ++i)
 	{
 		file_names_vec.push_back("test1.pdf");
 		file_names_vec.push_back("test2.tar");
