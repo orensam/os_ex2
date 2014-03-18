@@ -31,26 +31,27 @@ static const char* FILE_CMD = "file";
 static const char* FILE_FLAG_FLUSH = "-n";
 static const char* FILE_FLAG_STDIN = "-f-";
 
-static const std::string ERROR_STR = " error: ";
+// Function names
 static const std::string FUNC_INIT = "pft_init";
 static const std::string FUNC_GET_STATS = "pft_get_stats";
 static const std::string FUNC_FIND_TYPES = "pft_find_types";
 static const std::string FUNC_SET_PARA = "setParallelismLevel";
 static const std::string FUNC_DONE = "pft_done";
 
+// Error strings
+static const std::string ERROR_STR = " error: ";
 static const std::string ERROR_BAD_ALLOC = "Memory allocation error";
-static const std::string ERROR_FORK = "Fork error";
-static const std::string ERROR_DUP = "Dup error";
-static const std::string ERROR_CLOSE = "Close error";
-static const std::string ERROR_PIPE = "Pipe error";
-static const std::string ERROR_EXECL = "Execl error";
+static const std::string ERROR_FORK = "Error performing fork";
+static const std::string ERROR_CHILD = "Error creating child process";
+static const std::string ERROR_CLOSE = "Error closing a file descriptor";
+static const std::string ERROR_PIPE = "Error creating pipe";
 static const std::string ERROR_N_PARA = "Invalid parallelism level";
 static const std::string ERROR_NULLPTR = "Null pointer exception";
 static const std::string ERROR_READ = "Pipe read error";
 static const std::string ERROR_WRITE = "Pipe write error";
 
+// Delimiters
 static const char NEWLINE = '\n';
-
 
 // Return values
 static const int CODE_SUCCESS = 0;
@@ -66,7 +67,7 @@ int** outPipes = nullptr; // Parent writes to children
 int** inPipes = nullptr; // Parent reads from children
 
 std::vector<pid_t> children;
-
+bool hasChildended = false;
 // Stats
 double statTime;
 int statFileNum;
@@ -105,6 +106,11 @@ int FDWriteToParent(int childNum)
 	return inPipes[childNum][1];
 }
 
+/**
+ * Sets the last error to the given error and func name
+ * @param func_name the function name
+ * @param error the error
+ */
 void setError(const std::string& func_name, const std::string& error)
 {
 	last_error = func_name + ERROR_STR + error;
@@ -180,7 +186,6 @@ int spawnChildren()
 	}
 	catch (char const* str)
 	{
-		killChildren();
 		throw;
 	}
 
@@ -198,24 +203,24 @@ int spawnChildren()
 			if(dup2(FDReadFromParent(child), STDIN_FILENO) < 0 ||
 			   dup2(FDWriteToParent(child), STDOUT_FILENO) < 0)
 			{
-				throw ERROR_DUP;
+				_exit(CODE_FAIL);
 			}
 
 			for (int i = 0; i < para_level; ++i)
 			{
 				if (close(FDReadFromChild(i)) < 0 || close(FDWriteToChild(i)) < 0 )
 				{
-					throw ERROR_CLOSE;
+					_exit(CODE_FAIL);
 				}
 			}
 
 			int res = execl(FILE_CMD_PATH, FILE_CMD, FILE_FLAG_FLUSH, FILE_FLAG_STDIN, NULL);
 			if(res < 0)
 			{
-				throw ERROR_EXECL;
+				_exit(CODE_FAIL);
 			}
-
 		}
+
 		else
 		{
 			children.push_back(pid);
@@ -226,6 +231,11 @@ int spawnChildren()
 		}
 	}
 	return CODE_SUCCESS;
+}
+
+void childErrorHandler(int sig)
+{
+	hasChildended = true;
 }
 
 /*
@@ -241,13 +251,11 @@ Return value:
 int pft_init(int n)
 {
 	pft_clear_stats();
-	try
+	signal(SIGCHLD, &childErrorHandler);
+
+	if (setParallelismLevel(n) != CODE_SUCCESS)
 	{
-		setParallelismLevel(n);
-	}
-	catch (char const* str)
-	{
-		setError(FUNC_INIT, str);
+		setError(FUNC_INIT, pft_get_error());
 		return CODE_FAIL;
 	}
 	return CODE_SUCCESS;
@@ -268,7 +276,6 @@ Return value:
 int pft_done()
 {
 	try
-
 	{
 		return killChildren();
 	}
@@ -296,7 +303,7 @@ int setParallelismLevel(int n)
 	if(n <= 0)
 	{
 		setError(FUNC_SET_PARA, ERROR_N_PARA);
-		throw ERROR_N_PARA;
+		return CODE_FAIL;
 	}
 	try
 	{
@@ -306,7 +313,17 @@ int setParallelismLevel(int n)
 	}
 	catch (char const* str)
 	{
+		try
+		{
+			killChildren();
+		}
+		catch (char const* str)
+		{
+			setError(FUNC_SET_PARA, str);
+			return CODE_FAIL;
+		}
 		setError(FUNC_SET_PARA, str);
+		return CODE_FAIL;
 	}
 	return CODE_SUCCESS;
 }
@@ -321,8 +338,6 @@ const std::string pft_get_error()
 {
 	return last_error;
 }
-
-
 
 /*
 This method initialize the given pft_stats_struct with the current statistics collected by the pft library.
@@ -365,8 +380,6 @@ void pft_clear_stats()
 	statFileNum = 0;
 }
 
-
-
 fd_set getReadFDs()
 {
 	fd_set reads;
@@ -379,8 +392,9 @@ fd_set getReadFDs()
 	return reads;
 }
 
-std::string readAllFromFD(int fd)
+std::string readAllFromChild(int child)
 {
+	int fd = FDReadFromChild(child);
 	char temp_buff[PIPE_BUF] = "";
 	if (read(fd, temp_buff, PIPE_BUF) < 0)
 	{
@@ -388,6 +402,17 @@ std::string readAllFromFD(int fd)
 	}
 	std::string str = std::string(temp_buff);
 	return str;
+}
+
+int writeToChild(int child, std::string str)
+{
+	int write_fd = FDWriteToChild(child);
+	int written = write(write_fd, str.c_str(), str.size());
+	if (written < 0)
+	{
+		throw ERROR_WRITE;
+	}
+	return written;
 }
 
 int getMaxFD()
@@ -440,7 +465,10 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 
 	if(total_files < para_level)
 	{
-		setParallelismLevel(total_files);
+		if (setParallelismLevel(total_files) == CODE_FAIL)
+		{
+			setError(FUNC_FIND_TYPES, pft_get_error());
+		}
 	}
 
 	std::vector< std::queue<int> > positions(para_level);
@@ -462,42 +490,37 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 		{
 			if(positions[child].empty())
 			{
-//				std::cout << "CAN WRITE (empty queue) to child " << child << ". to_write: " << to_write << std::endl;
 				std::string filenames = "";
 				for (int i = 0; i < send_files_n && to_write < total_files; ++i, ++to_write)
 				{
 					filenames += file_names_vec[to_write] + NEWLINE;
 					positions[child].push(to_write);
-//					std::cout << "child: " << child << " index: " << to_write << std::endl;
 				}
-
-				int write_fd = FDWriteToChild(child);
-//				std::cout << "Writing the string: '" << filenames << "' to child " << child << std::endl;
-				int written = write(write_fd, filenames.c_str(), filenames.size());
-//				std::cout << "Wrote " << written << " bytes to child " << child << std::endl;
-				if (written < 0)
+				try
 				{
-					setError(FUNC_FIND_TYPES, ERROR_WRITE);
+					writeToChild(child, filenames);
+				}
+				catch (const char* str)
+				{
+					setError(FUNC_FIND_TYPES, str);
 					return CODE_FAIL;
 				}
 			}
 		}
 
-
-		fd_set ready_reads(reads);
+		fd_set ready_reads = reads;
 		select(max_fd, &ready_reads, NULL, NULL, NULL);
 
 		// Read from children
 		for(int child = 0; child < para_level; ++child)
 		{
-//			std::cout << "Handling read from child " << child << std::endl;
 			int read_fd = FDReadFromChild(child);
 			if(remaining_read_files > 0 && FD_ISSET(read_fd, &ready_reads))
 			{
 				std::string output;
 				try
 				{
-					output = readAllFromFD(read_fd);
+					output = readAllFromChild(child);
 				}
 				catch (const char* str)
 				{
@@ -505,11 +528,9 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 					return CODE_FAIL;
 				}
 
-//				std::cout << "Read from child " << child << " output: "<< output << std::endl;
 				int pos = 0;
 				while ((pos = output.find(NEWLINE)) != -1 && remaining_read_files > 0)
 				{
-//					std::cout << "read child: " << child << ", index of newline: " << pos << ", file_vec index: " << positions[child].front() << " Got string: " << output.substr(0, pos) << std::endl;
 					types_vec[positions[child].front()].append(output.substr(0, pos));
 					positions[child].pop();
 					output = output.substr(pos + 1);
@@ -542,46 +563,86 @@ void printVector(std::vector<std::string>& vec)
 	}
 }
 
+// a method to print the statistics.
+void printStatistic( pft_stats_struct stat){
+	printf ("Statistic:\nFiles number=%d\nTime spent=%f\n",stat.file_num,stat.time_sec);
+}
+
 int main()
 {
-	pft_init(200);
-	sleep(1);
 	std::vector<std::string> file_names_vec;
 	std::vector<std::string> types_vec;
 
-	for(int i=0; i<50000; ++i)
+	for(int i=0; i<20000; ++i)
 	{
-		file_names_vec.push_back("test1.pdf");
-		file_names_vec.push_back("test2.tar");
-		file_names_vec.push_back("test3.zip");
+		file_names_vec.push_back("test1.jpg");
+		file_names_vec.push_back("test2.txt");
+		file_names_vec.push_back("test3.exe");
+		file_names_vec.push_back("test4dir");
+		file_names_vec.push_back("test5.tar");
 	}
 
-//	file_names_vec.push_back("file1");
-//	file_names_vec.push_back("file2");
-//	file_names_vec.push_back("file3");
-//	file_names_vec.push_back("file4");
-//	file_names_vec.push_back("file5");
-//	file_names_vec.push_back("file6");
-//	file_names_vec.push_back("file7");
-//	file_names_vec.push_back("file8");
-//	file_names_vec.push_back("file9");
-//	file_names_vec.push_back("file1");
-//	file_names_vec.push_back("file2");
-//	file_names_vec.push_back("file3");
-//	file_names_vec.push_back("file4");
-//	file_names_vec.push_back("file5");
-//	file_names_vec.push_back("file6");
-//	file_names_vec.push_back("file7");
-//	file_names_vec.push_back("file8");
-//	file_names_vec.push_back("file9");
+	pft_stats_struct stat;
 
+	pft_init(10);
+
+	std::cout << "\nIGNORE THIS RUN:" <<std::endl;
 	pft_find_types(file_names_vec, types_vec);
-	printVector(types_vec);
+	pft_get_stats(&stat);
+	printStatistic(stat);
+
+	std::cout << "\nPARA 7:" << std::endl;
+	setParallelismLevel(7);
+	pft_clear_stats();
+	pft_find_types(file_names_vec, types_vec);
+	pft_get_stats(&stat);
+	printStatistic(stat);
+
+
+	std::cout << "\nPARA 6:" << std::endl;
+	setParallelismLevel(6);
+	pft_clear_stats();
+	pft_find_types(file_names_vec, types_vec);
+	pft_get_stats(&stat);
+	printStatistic(stat);
+
+	std::cout << "\nPARA 5:" << std::endl;
+	setParallelismLevel(5);
+	pft_clear_stats();
+	pft_find_types(file_names_vec, types_vec);
+	pft_get_stats(&stat);
+	printStatistic(stat);
+
+	std::cout << "\nPARA 4:" << std::endl;
+	setParallelismLevel(4);
+	pft_clear_stats();
+	pft_find_types(file_names_vec, types_vec);
+	pft_get_stats(&stat);
+	printStatistic(stat);
+
+	std::cout << "\nPARA 3:" << std::endl;
+	setParallelismLevel(3);
+	pft_clear_stats();
+	pft_find_types(file_names_vec, types_vec);
+	pft_get_stats(&stat);
+	printStatistic(stat);
+
+	std::cout << "\nPARA 2:" << std::endl;
+	setParallelismLevel(2);
+	pft_clear_stats();
+	pft_find_types(file_names_vec, types_vec);
+	pft_get_stats(&stat);
+	printStatistic(stat);
+
+	std::cout << "\nPARA 1:" << std::endl;
+	setParallelismLevel(1);
+	pft_clear_stats();
+	pft_find_types(file_names_vec, types_vec);
+	pft_get_stats(&stat);
+	printStatistic(stat);
+
+//	printVector(types_vec);
+
 	pft_done();
 }
-
-
-
-
-
 

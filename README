@@ -1,0 +1,21 @@
+orensam
+yoniherzog
+
+================
+=== OS - Ex2 ===
+================
+
+Oren Samuel ID 200170694
+Yoni Herzog ID 200299956
+
+=== Program Description ===
+
+The program pft.cpp (and the library libpft that is created from it) are built to parallelize
+the operation of Linux's 'file' command.
+
+
+=== Performance Graph ===
+
+=== Notes ====
+In the code there is some code repetition which could have been avoided using macros and such, but 
+we've decided for the sake of readability to leave it as it is. 
