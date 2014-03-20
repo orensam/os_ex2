@@ -13,9 +13,67 @@ Yoni Herzog ID 200299956
 The program pft.cpp (and the library libpft that is created from it) are built to parallelize
 the operation of Linux's 'file' command.
 
+Our implementation:
+The main ('parent') process, upon calling the init functions, spwans N child-processes, each running
+a 'file' command, where N is the parallelism level specified by the user.
+These processes, which are quite literally replaced by the file command, wait for input 
+for as long as they live, and flush the output as soon as they can (i.e, the 'file' command 
+is executed with -n -f-).
+The processes are alive until they either encounter an error, or pft_done is called.
+
+The "chunking" approach implemented here is exactly as specified in the exercise description -
+There is a default, programmer-configurable, chunk size (set to 50) which is used when the (number
+of files) / (parallelism level) is greater than said chunk_size. otherwise, an even distribution
+of the files is done between the different child processes.
+In the odd case where there are less files than processes, the parallelism level is set to
+the number of files.
+ 
+Advantages/disadvantages of our implementation -
+The big advatage of this simple implementation is its simplicity - N processes are opened,
+They receive and output data, and closed when the user wishes. 
+Furthermore, the parallelism is disjoint - in the sense that the parent process
+does all the dispatching, memory management, and communication.
+This means the children processes do not know anything about eachother, they don't have to perform
+any kind of communication (other than 'file' command's I/O), and they do not need to allocate 
+any memory. This also means that the child code is very short and simple - 
+only handle the file descriptors, perform the EXECL command, and that's it.
+
+This advantage is, in a sense, a double-edged sword - a more complicated
+implementation using shared memory and communication between processes could have diminished the 
+serial part of the pft_find_types function, and further parallelize the program.
+
+Out pft_find_types function iterates until all the files have been processed by a child process
+and put into the types_vector. Every child process has a filename queue associated with it,
+and in each iteration, the processes which have an empty queue (i.e, they finished all their
+previous work and the output was read by the parent process) receive a new chunk of filenames.
+Then, all the process which are ready for reading (as specified by the select() syscall)
+have their pipe read by the parent process, and the results are put into the types vector.
+
+We also handle lines which are cut in the middle, by appending into the types_vector in the
+needed index, and advancing to the next index only when a newline is encountered. 
+
+-- Error handling --
+Our internal functions (i.e function which are not part of the library's API) all throw errors
+upon failure, indicating the nature of the error. These errors, in turn, are caught by the calling
+functions. If one of the public functions catch an error, it updates the 'last_error' parameter
+of the library, with the relevant error content thrown by the lower level functions, and returns
+CODE_FAIL (i.e -1) to the user.
+When a child process encounters an unrecoverable problem at creation, i.e dup() or execl() fail,
+a signal (SIGUSR1) is sent to the parent using the kill() syscall. This is part of our design -
+this enables the parent process to identify the origin of the problem, and set en error message
+and exit accordingly when trying to use find_types(). 
 
 === Performance Graph ===
+All tests were made on aquarium machines.
+As you can see in the attached graph, the performance of running over 100,000 files (as specified
+in the exercise description) is improved significantly when using larger parallelism levels -
+A single-process program takes around 94 seconds, a double-process progeam takes roughly half that,
+and it goes on and improves when increasing the number of processes -
+You can see in the graph that the improvement is asymptotic - the graph reaches a plateau 
+at the 5-7 process points in the graph.
+This behavior makes sense - parallelism makes the program run much faster (x4 runtime improvement),
+but there is still a serial part in the program (the parent process code) which is a bottleneck -
+the dispatching of filenames and reading outputs still takes a certain amount of time,
+which is not improved by the increasing  amount of child processes.    
 
-=== Notes ====
-In the code there is some code repetition which could have been avoided using macros and such, but 
-we've decided for the sake of readability to leave it as it is. 
+

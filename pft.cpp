@@ -1,8 +1,9 @@
 /*
  * pft.cpp
  *
- *  Created on: Mar 10, 2014
- *      Author: orensam
+ *	A program that parallelises severl of linux's 'file' commands
+ *	in order to improve its running time.
+ *
  */
 
 #include <sys/time.h>
@@ -42,7 +43,7 @@ static const std::string FUNC_DONE = "pft_done";
 static const std::string ERROR_STR = " error: ";
 static const std::string ERROR_BAD_ALLOC = "Memory allocation error";
 static const std::string ERROR_FORK = "Error performing fork";
-static const std::string ERROR_CHILD = "Error creating child process";
+static const std::string ERROR_CHILD = "Child process error";
 static const std::string ERROR_CLOSE = "Error closing a file descriptor";
 static const std::string ERROR_PIPE = "Error creating pipe";
 static const std::string ERROR_N_PARA = "Invalid parallelism level";
@@ -60,17 +61,18 @@ static const int CODE_FAIL = -1;
 // Process chuck size
 const int DEFAULT_CHUNK_SIZE = 50;
 
+
 // Parent <-> Children communication pipes
-//std::vector<int*> outPipes; // Parent writes to children
-//std::vector<int*> inPipes; // Parent reads from children
 int** outPipes = nullptr; // Parent writes to children
 int** inPipes = nullptr; // Parent reads from children
 
+// Children handling
 std::vector<pid_t> children;
-bool hasChildended = false;
+static bool childrenAlive = true;
+
 // Stats
-double statTime;
 int statFileNum;
+double statTime;
 
 
 
@@ -157,6 +159,9 @@ int createPipes()
 	return CODE_SUCCESS;
 }
 
+/**
+ * Kills all the child processes.
+ */
 int killChildren()
 {
 	if (pipes_inited)
@@ -178,17 +183,12 @@ int killChildren()
 	return CODE_SUCCESS;
 }
 
+/**
+ * Creates all the child processes and pipes
+ */
 int spawnChildren()
 {
-	try
-	{
-		createPipes();
-	}
-	catch (char const* str)
-	{
-		throw;
-	}
-
+	createPipes();
 	for(int child = 0; child < para_level; ++child)
 	{
 		pid_t pid = fork();
@@ -203,21 +203,21 @@ int spawnChildren()
 			if(dup2(FDReadFromParent(child), STDIN_FILENO) < 0 ||
 			   dup2(FDWriteToParent(child), STDOUT_FILENO) < 0)
 			{
-				_exit(CODE_FAIL);
+				kill(getppid(), SIGUSR1);
 			}
 
 			for (int i = 0; i < para_level; ++i)
 			{
 				if (close(FDReadFromChild(i)) < 0 || close(FDWriteToChild(i)) < 0 )
 				{
-					_exit(CODE_FAIL);
+					kill(getppid(), SIGUSR1);
 				}
 			}
 
 			int res = execl(FILE_CMD_PATH, FILE_CMD, FILE_FLAG_FLUSH, FILE_FLAG_STDIN, NULL);
 			if(res < 0)
 			{
-				_exit(CODE_FAIL);
+				kill(getppid(), SIGUSR1);
 			}
 		}
 
@@ -233,25 +233,44 @@ int spawnChildren()
 	return CODE_SUCCESS;
 }
 
+/**
+ * Error handler for child untimely death
+ * @param sig the singal number
+ */
 void childErrorHandler(int sig)
 {
-	hasChildended = true;
+	if (sig == SIGUSR1)
+	{
+		childrenAlive = false;
+	}
 }
 
-/*
-Initialize the pft library.
-Argument:
-	"n" is the level of parallelism to use (number of parallel ‘file’) commands.
-This method should initialize the library with empty statistics.
+/**
+ * Sets the signal handler for the children.
+ */
+void setSignalHandler()
+{
+	struct sigaction psa;
+	psa.sa_handler = &childErrorHandler;
+	psa.sa_flags = SA_NOCLDSTOP;
+	sigaction(SIGUSR1, &psa, NULL);
+}
 
-A failure may happen if a system call fails (e.g. alloc) or if n is not positive.
-Return value:
-	A valid error message, started with "pft_init error:" should be obtained by using the pft_get_error().
+/**
+ * Initialize the pft library.
+ * Argument:
+ *	"n" is the level of parallelism to use (number of parallel ‘file’) commands.
+ * This method should initialize the library with empty statistics.
+ *
+ * A failure may happen if a system call fails (e.g. alloc) or if n is not positive.
+ * Return value:
+ *	A valid error message, started with "pft_init error:" should be obtained by
+ *	using the pft_get_error().
  */
 int pft_init(int n)
 {
 	pft_clear_stats();
-	signal(SIGCHLD, &childErrorHandler);
+	setSignalHandler();
 
 	if (setParallelismLevel(n) != CODE_SUCCESS)
 	{
@@ -263,16 +282,16 @@ int pft_init(int n)
 
 
 
-/*
-This function called when the user finished to use the library.
-Its purpose is to free the memory/resources that allocated by the library.
-
-The function return error FAILURE if a system call fails.
-Return value:
-	On success return SUCCESS, on error return FAILURE.
-	A valid error message, started with "pft_done error:" should be obtained by using the pft_get_error().
+/**
+ * This function called when the user finished to use the library.
+ * Its purpose is to free the memory/resources that allocated by the library.
+ *
+ * The function return error FAILURE if a system call fails.
+ * Return value:
+ *	On success return SUCCESS, on error return FAILURE.
+ *	A valid error message, started with "pft_done error:" should be obtained by
+ *	using the pft_get_error().
  */
-
 int pft_done()
 {
 	try
@@ -287,17 +306,16 @@ int pft_done()
 	return CODE_SUCCESS;
 }
 
-
-/*
-Set the parallelism level.
-Argument:
-	"n" is the level of parallelism to use (number of parallel ‘file’) commands.
-A failure may happen if a system call fails (e.g. alloc) or n is not positive.
-Return value:
-	On success return SUCCESS, on error return FAILURE.
-	A valid error message, started with "setParallelismLevel error:" should be obtained by using the pft_get_error().
+/**
+ * Set the parallelism level.
+ * Argument:
+ * 	"n" is the level of parallelism to use (number of parallel ‘file’) commands.
+ * A failure may happen if a system call fails (e.g. alloc) or n is not positive.
+ * Return value:
+ * 	On success return SUCCESS, on error return FAILURE.
+ * 	A valid error message, started with "setParallelismLevel error:" should be obtained by
+ * 	using the pft_get_error().
  */
-
 int setParallelismLevel(int n)
 {
 	if(n <= 0)
@@ -328,36 +346,37 @@ int setParallelismLevel(int n)
 	return CODE_SUCCESS;
 }
 
-/*
-// Return the last error message.
-// The message should be empty if there was no error since the last initialization.
-// This function must not fail.
+/**
+ * Return the last error message.
+ * The message should be empty if there was no error since the last initialization.
+ * This function must not fail.
  */
-
 const std::string pft_get_error()
 {
 	return last_error;
 }
 
-/*
-This method initialize the given pft_stats_struct with the current statistics collected by the pft library.
-
-If statistic is not null, the function assumes that the given structure have been allocated,
-and updates file_num to contain the total number of files processed up to now
-and time_sec to contain the total time in seconds spent in processing.
-
-A failure may happen if a system call fails or if the statistic is null.
-
-For example, if I call "pft_init", wait 3 seconds, call "pft_find_types" that read 7,000,000 files in 5 seconds, and then call to this
-method, the statistics should be: statistic->time_sec = 5 and statistic->file_num = 7,000,000.
-
-Parameter:
-	statistic - a pft_stats_struct structure that will be initialized with the current statistics.
-Return value:
-	On success return SUCCESS, on error return FAILURE.
-	A valid error message, started with "pft_get_stats error:" should be obtained by using the pft_get_error().
+/**
+ * This method initialize the given pft_stats_struct with the current statistics collected
+ * by the pft library.
+ *
+ * If statistic is not null, the function assumes that the given structure have been allocated,
+ * and updates file_num to contain the total number of files processed up to now
+ * and time_sec to contain the total time in seconds spent in processing.
+ *
+ * A failure may happen if a system call fails or if the statistic is null.
+ *
+ * For example, if I call "pft_init", wait 3 seconds, call "pft_find_types" that read 7,000,000
+ * files in 5 seconds, and then call to this
+ * method, the statistics should be: statistic->time_sec = 5 and statistic->file_num = 7,000,000.
+ *
+ * Parameter:
+ * 	statistic - a pft_stats_struct structure that will be initialized with the current statistics.
+ * Return value:
+ * 	On success return SUCCESS, on error return FAILURE.
+ * 	A valid error message, started with "pft_get_stats error:" should be obtained by
+ * 	using the pft_get_error().
  */
-
 int pft_get_stats(pft_stats_struct* statistic)
 {
 	if (!statistic)
@@ -370,7 +389,7 @@ int pft_get_stats(pft_stats_struct* statistic)
 	return CODE_SUCCESS;
 }
 
-/*
+/**
  * Clear the statistics setting all to 0.
  * The function must not fail.
  */
@@ -380,6 +399,9 @@ void pft_clear_stats()
 	statFileNum = 0;
 }
 
+/**
+ * Returns an fd_set of the reading-from-children file descriptor
+ */
 fd_set getReadFDs()
 {
 	fd_set reads;
@@ -392,11 +414,14 @@ fd_set getReadFDs()
 	return reads;
 }
 
+/**
+ * Reads PIPE_BUF bytes from the given child and returns the string.
+ */
 std::string readAllFromChild(int child)
 {
 	int fd = FDReadFromChild(child);
 	char temp_buff[PIPE_BUF] = "";
-	if (read(fd, temp_buff, PIPE_BUF) < 0)
+	if (read(fd, temp_buff, PIPE_BUF) <= 0)
 	{
 		throw ERROR_READ;
 	}
@@ -404,6 +429,10 @@ std::string readAllFromChild(int child)
 	return str;
 }
 
+/**
+ * Writes the string str to given child.
+ * Returns number of bytes written.
+ */
 int writeToChild(int child, std::string str)
 {
 	int write_fd = FDWriteToChild(child);
@@ -415,6 +444,10 @@ int writeToChild(int child, std::string str)
 	return written;
 }
 
+/**
+ * Returns the maximal FD in the given set.
+ * @return
+ */
 int getMaxFD()
 {
 	int max_fd = 0;
@@ -440,29 +473,40 @@ double calcTimeDiff(timeval* t1, timeval* t2)
 	return res.tv_sec + res.tv_usec / 1000000.0;
 }
 
-/*
-This function uses ‘file’ to calculate the type of each file in the given vector using n parallelism level.
-It gets a vector contains the name of the files to check (file_names_vec) and an empty vector (types_vec).
-The function runs "file" command on each file in the file_names_vec (even if it is not a valid file) using n parallelism level,
-and insert its result to the same index in types_vec.
-
-The function fails if any of his parameters is null, if types_vec is not an empty vector or if a system called failed
-(for example fork failed).
-
-Parameters:
-	file_names_vec - a vector contains the absolute or relative paths of the files to check.
-	types_vec - an empty vector that will be initialized with the results of "file" command on each file in file_names_vec.
-Return value:
-	On success return SUCCESS, on error return FAILURE.
-	A valid error message, started with "pft_find_types error:" should be obtained by using the pft_get_error().
+/**
+ * This function uses ‘file’ to calculate the type of each file in the given vector
+ * using n parallelism level.
+ * It gets a vector contains the name of the files to check (file_names_vec) and an
+ * empty vector (types_vec).
+ * The function runs "file" command on each file in the file_names_vec (even if it is not a valid
+ * file) using n parallelism level,
+ * and insert its result to the same index in types_vec.
+ *
+ * The function fails if any of his parameters is null, if types_vec is not an empty vector or
+ * if a system called failed
+ * (for example fork failed).
+ *
+ * Parameters:
+ * 	file_names_vec - a vector contains the absolute or relative paths of the files to check.
+ * 	types_vec - an empty vector that will be initialized with the results of "file" command on
+ * 	each file in file_names_vec.
+ * Return value:
+ * 	On success return SUCCESS, on error return FAILURE.
+ * 	A valid error message, started with "pft_find_types error:" should be obtained by
+ * 	using the pft_get_error().
  */
 int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::string>& types_vec)
 {
+	// Number of files
 	int total_files = file_names_vec.size();
+	// Init types vector
 	types_vec = std::vector<std::string>(total_files, "");
+	// index of next file name to write
 	int to_write = 0;
+	// Number of files to send each time
 	int send_files_n = std::min(DEFAULT_CHUNK_SIZE, total_files/para_level);
 
+	// Change parallesim level if it is larger than number of files
 	if(total_files < para_level)
 	{
 		if (setParallelismLevel(total_files) == CODE_FAIL)
@@ -471,43 +515,62 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 		}
 	}
 
+	// Queue of files for each child
 	std::vector< std::queue<int> > positions(para_level);
+
+	// Number of files still not handled
 	int remaining_read_files = total_files;
+
+	// FDs
 	int max_fd = getMaxFD()+1;
 	fd_set reads = getReadFDs();
 
+	// Stats
 	timeval begin;
 	timeval end;
-
 	if (gettimeofday(&begin, NULL) != CODE_SUCCESS)
 	{
 		return CODE_FAIL;
 	}
+
 	while(remaining_read_files > 0)
 	{
+		// While not all files handled
+		if (!childrenAlive)
+		{
+			// Child died
+			setError(FUNC_FIND_TYPES, ERROR_CHILD);
+			return CODE_FAIL;
+		}
+
 		// Write to children
 		for(int child = 0; child < para_level && to_write < total_files; ++child)
 		{
 			if(positions[child].empty())
 			{
+				// Child finished previous work
 				std::string filenames = "";
 				for (int i = 0; i < send_files_n && to_write < total_files; ++i, ++to_write)
 				{
+					// Create input string
 					filenames += file_names_vec[to_write] + NEWLINE;
 					positions[child].push(to_write);
 				}
 				try
 				{
+					// Write it to child
 					writeToChild(child, filenames);
 				}
 				catch (const char* str)
 				{
+					// Write problem
 					setError(FUNC_FIND_TYPES, str);
 					return CODE_FAIL;
 				}
 			}
 		}
 
+		// Wait until we can read
 		fd_set ready_reads = reads;
 		select(max_fd, &ready_reads, NULL, NULL, NULL);
 
@@ -517,18 +580,22 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 			int read_fd = FDReadFromChild(child);
 			if(remaining_read_files > 0 && FD_ISSET(read_fd, &ready_reads))
 			{
+				// Can read from child, and not all files read
 				std::string output;
 				try
 				{
+					// Read from child
 					output = readAllFromChild(child);
 				}
 				catch (const char* str)
 				{
+					// Read problem
 					setError(FUNC_FIND_TYPES, str);
 					return CODE_FAIL;
 				}
 
 				int pos = 0;
+				// Add to types vec
 				while ((pos = output.find(NEWLINE)) != -1 && remaining_read_files > 0)
 				{
 					types_vec[positions[child].front()].append(output.substr(0, pos));
@@ -544,13 +611,15 @@ int pft_find_types(std::vector<std::string>& file_names_vec, std::vector<std::st
 		}
 	}
 
+	// Stats
 	if (gettimeofday(&end, NULL) != CODE_SUCCESS)
 	{
 		return CODE_FAIL;
 	}
+	statFileNum += total_files;
+	statTime += calcTimeDiff(&begin, &end);
 
-	statFileNum = total_files;
-	statTime = calcTimeDiff(&begin, &end);
+	// Done!
 	return CODE_SUCCESS;
 }
 
